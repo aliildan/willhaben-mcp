@@ -10,6 +10,7 @@ import {
 } from "./types.js";
 import { scrapeSearchResults } from "./scraper.js";
 import { resolveLocationToAreaId } from "./geo.js";
+import { sanitizeListing } from "../utils/formatters.js";
 import {
   SEARCH_URL_PATTERNS,
   SORT_CODES,
@@ -18,17 +19,46 @@ import {
   TRANSMISSION_IDS,
   CONDITION_IDS,
   VERTICAL_NAMES,
+  clampSearchPaging,
 } from "../utils/constants.js";
 
 /**
  * Flatten willhaben's attribute list into a name → value(s) map.
  */
 export function attributesToMap(attributes: WillhabenAttribute[] | undefined): Record<string, string | string[]> {
-  const attrs: Record<string, string | string[]> = {};
+  const attrs = Object.create(null) as Record<string, string | string[]>;
   for (const attr of attributes ?? []) {
     attrs[attr.name] = attr.values.length === 1 ? attr.values[0] : attr.values;
   }
   return attrs;
+}
+
+/**
+ * Attribute keys dropped from the emitted `attributes` map: each either
+ * duplicates a top-level field on the simplified listing or is an internal
+ * willhaben identifier no consumer reads. They are read (where needed) before
+ * this runs, so stripping them loses no information.
+ *
+ * Worth keeping: the raw map is returned for every listing in
+ * `structuredContent`, and these six accounted for ~23% of a deep-search
+ * payload — `ALL_IMAGE_URLS` alone repeats every image path per ad.
+ */
+const REDUNDANT_ATTRIBUTES = [
+  "ALL_IMAGE_URLS",        // → image_url (summaries) / images[] (details)
+  "SEO_URL",               // → url
+  "HEADING",               // → title
+  "AD_SEARCHRESULT_LOGO",  // internal asset path
+  "ORG_UUID",              // internal id
+  "AD_UUID",               // internal id
+] as const;
+
+/** Drop the redundant keys above from a flattened attribute map. */
+export function stripRedundantAttributes(
+  attrs: Record<string, string | string[]>,
+): Record<string, string | string[]> {
+  const out = { ...attrs };
+  for (const key of REDUNDANT_ATTRIBUTES) delete out[key];
+  return out;
 }
 
 /**
@@ -53,27 +83,30 @@ export function simplifyAdSummary(ad: WillhabenAdSummary): SimplifiedListing {
   const isPrivate = attrs.ISPRIVATE as string | undefined;
   const published = attrs.PUBLISHED_String as string | undefined;
 
-  return {
+  const parsedPrice = priceNumber ? parseFloat(priceNumber) : NaN;
+
+  return sanitizeListing({
     id: ad.id,
     title: heading ?? ad.description ?? "",
     price: priceForDisplay ?? null,
-    price_number: priceNumber ? parseFloat(priceNumber) : null,
+    price_number: Number.isFinite(parsedPrice) ? parsedPrice : null,
     location,
     url,
     image_url: imageUrl,
     published: published ?? null,
-    attributes: attrs,
+    attributes: stripRedundantAttributes(attrs),
     vertical: VERTICAL_NAMES[ad.verticalId] ?? String(ad.verticalId),
     is_private: isPrivate === "1",
     advertiser_name: orgName ?? null,
-  };
+  });
 }
 
 /**
  * Universal search across all verticals
  */
 export async function searchListings(input: SearchInput) {
-  const { vertical: verticalName, keyword, category, rows = 30, page = 1, sort, price_from, price_to, location } = input;
+  const { vertical: verticalName, keyword, category, sort, price_from, price_to, location, area_id } = input;
+  const { rows, page } = clampSearchPaging(input.rows, input.page);
 
   const verticalMap: Record<string, number> = {
     marketplace: VerticalId.MARKTPLATZ,
@@ -123,8 +156,10 @@ export async function searchListings(input: SearchInput) {
     params.PRICE_TO = String(price_to);
   }
 
-  // Location filter → areaId (Austrian state name/alias or numeric area ID)
-  if (location) {
+  // Location filter → areaId (pre-resolved ID wins; else resolve the free text)
+  if (area_id) {
+    params.areaId = area_id;
+  } else if (location) {
     const areaId = await resolveLocationToAreaId(location);
     if (areaId) params.areaId = areaId;
   }
@@ -138,22 +173,12 @@ export async function searchListings(input: SearchInput) {
   const urlPath = SEARCH_URL_PATTERNS[verticalId](params);
   const { result } = await scrapeSearchResults(urlPath);
 
-  if (!result) {
-    return {
-      total: 0,
-      page,
-      rows_per_page: rows,
-      listings: [],
-      vertical: verticalName,
-    };
-  }
-
   const listings = (result.advertSummaryList?.advertSummary ?? []).map(simplifyAdSummary);
 
   return {
     total: result.rowsFound,
-    page: result.pageRequested,
-    rows_per_page: result.rowsRequested,
+    page: result.pageRequested ?? page,
+    rows_per_page: result.rowsRequested ?? rows,
     listings,
     vertical: verticalName,
     description: result.searchTitle,
@@ -219,9 +244,11 @@ export function resolveRealEstateCategory(propertyType: string | undefined, acti
  * Search real estate listings
  */
 export async function searchRealEstate(input: RealEstateSearchInput) {
-  const { property_type, action = "buy", location, price_from, price_to, rooms, area_from, area_to, sort, rows = 30, page = 1 } = input;
+  const { keyword, category, property_type, action = "buy", location, area_id, price_from, price_to, rooms, area_from, area_to, sort } = input;
+  const { rows, page } = clampSearchPaging(input.rows, input.page);
 
-  const categoryPath = resolveRealEstateCategory(property_type, action === "rent" ? "rent" : "buy");
+  // Explicit category path (e.g. from deep search) wins over property_type/action.
+  const categoryPath = category || resolveRealEstateCategory(property_type, action === "rent" ? "rent" : "buy");
 
   const params: Record<string, string> = {
     rows: String(rows),
@@ -233,12 +260,15 @@ export async function searchRealEstate(input: RealEstateSearchInput) {
     if (sortCode) params.sort = sortCode;
   }
 
+  if (keyword) params.keyword = keyword;
   if (price_from !== undefined) params.PRICE_FROM = String(price_from);
   if (price_to !== undefined) params.PRICE_TO = String(price_to);
   if (rooms) params.NUMBER_OF_ROOMS = String(rooms);
   if (area_from !== undefined) params["ESTATE_SIZE/LIVING_AREA_FROM"] = String(area_from);
   if (area_to !== undefined) params["ESTATE_SIZE/LIVING_AREA_TO"] = String(area_to);
-  if (location) {
+  if (area_id) {
+    params.areaId = area_id;
+  } else if (location) {
     const areaId = await resolveLocationToAreaId(location);
     if (areaId) params.areaId = areaId;
   }
@@ -246,16 +276,12 @@ export async function searchRealEstate(input: RealEstateSearchInput) {
   const urlPath = SEARCH_URL_PATTERNS[VerticalId.IMMOBILIEN]({ ...params, category: categoryPath });
   const { result } = await scrapeSearchResults(urlPath);
 
-  if (!result) {
-    return { total: 0, page, rows_per_page: rows, listings: [], vertical: "real_estate" };
-  }
-
   const listings = (result.advertSummaryList?.advertSummary ?? []).map(simplifyAdSummary);
 
   return {
     total: result.rowsFound,
-    page: result.pageRequested,
-    rows_per_page: result.rowsRequested,
+    page: result.pageRequested ?? page,
+    rows_per_page: result.rowsRequested ?? rows,
     listings,
     vertical: "real_estate",
     description: result.searchTitle,
@@ -266,7 +292,8 @@ export async function searchRealEstate(input: RealEstateSearchInput) {
  * Search car listings
  */
 export async function searchCars(input: CarSearchInput) {
-  const { make, model, location, price_from, price_to, year_from, year_to, mileage_from, mileage_to, fuel_type, transmission, condition, sort, rows = 30, page = 1 } = input;
+  const { keyword, make, model, location, area_id, price_from, price_to, year_from, year_to, mileage_from, mileage_to, fuel_type, transmission, condition, sort } = input;
+  const { rows, page } = clampSearchPaging(input.rows, input.page);
 
   const params: Record<string, string> = {
     rows: String(rows),
@@ -291,9 +318,12 @@ export async function searchCars(input: CarSearchInput) {
     if (/^\d+$/.test(model)) params[CAR_FILTER_PARAMS.model] = model;
     else keywordParts.push(model);
   }
+  if (keyword) keywordParts.push(keyword);
   if (keywordParts.length > 0) params.keyword = keywordParts.join(" ");
 
-  if (location) {
+  if (area_id) {
+    params.areaId = area_id;
+  } else if (location) {
     const areaId = await resolveLocationToAreaId(location);
     if (areaId) params.areaId = areaId;
   }
@@ -320,16 +350,12 @@ export async function searchCars(input: CarSearchInput) {
   const urlPath = SEARCH_URL_PATTERNS[VerticalId.AUTO_MOTOR](params);
   const { result } = await scrapeSearchResults(urlPath);
 
-  if (!result) {
-    return { total: 0, page, rows_per_page: rows, listings: [], vertical: "cars" };
-  }
-
   const listings = (result.advertSummaryList?.advertSummary ?? []).map(simplifyAdSummary);
 
   return {
     total: result.rowsFound,
-    page: result.pageRequested,
-    rows_per_page: result.rowsRequested,
+    page: result.pageRequested ?? page,
+    rows_per_page: result.rowsRequested ?? rows,
     listings,
     vertical: "cars",
     description: result.searchTitle,
@@ -341,6 +367,8 @@ export interface MarketplaceSearchInput {
   category?: string;
   condition?: string;
   location?: string;
+  /** Pre-resolved willhaben areaId; when set, `location` is not resolved again. */
+  area_id?: string;
   price_from?: number;
   price_to?: number;
   sort?: string;
@@ -352,7 +380,8 @@ export interface MarketplaceSearchInput {
  * Search marketplace listings
  */
 export async function searchMarketplace(input: MarketplaceSearchInput = {}) {
-  const { keyword, category, condition, location, price_from, price_to, sort, rows = 30, page = 1 } = input;
+  const { keyword, category, condition, location, area_id, price_from, price_to, sort } = input;
+  const { rows, page } = clampSearchPaging(input.rows, input.page);
 
   const params: Record<string, string> = {
     rows: String(rows),
@@ -368,7 +397,9 @@ export async function searchMarketplace(input: MarketplaceSearchInput = {}) {
   if (price_from !== undefined) params.PRICE_FROM = String(price_from);
   if (price_to !== undefined) params.PRICE_TO = String(price_to);
 
-  if (location) {
+  if (area_id) {
+    params.areaId = area_id;
+  } else if (location) {
     const areaId = await resolveLocationToAreaId(location);
     if (areaId) params.areaId = areaId;
   }
@@ -391,16 +422,12 @@ export async function searchMarketplace(input: MarketplaceSearchInput = {}) {
   const urlPath = SEARCH_URL_PATTERNS[VerticalId.MARKTPLATZ]({ ...params, category: category ?? "" });
   const { result } = await scrapeSearchResults(urlPath);
 
-  if (!result) {
-    return { total: 0, page, rows_per_page: rows, listings: [], vertical: "marketplace" };
-  }
-
   const listings = (result.advertSummaryList?.advertSummary ?? []).map(simplifyAdSummary);
 
   return {
     total: result.rowsFound,
-    page: result.pageRequested,
-    rows_per_page: result.rowsRequested,
+    page: result.pageRequested ?? page,
+    rows_per_page: result.rowsRequested ?? rows,
     listings,
     vertical: "marketplace",
     description: result.searchTitle,

@@ -350,6 +350,8 @@ export interface SearchInput {
   keyword?: string;
   category?: string;
   location?: string;
+  /** Pre-resolved willhaben areaId; when set, `location` is not resolved again. */
+  area_id?: string;
   price_from?: number;
   price_to?: number;
   sort?: string;
@@ -358,9 +360,14 @@ export interface SearchInput {
 }
 
 export interface RealEstateSearchInput {
+  keyword?: string;
+  /** Explicit willhaben category path; when set, wins over property_type/action. */
+  category?: string;
   property_type?: string;
   action?: "buy" | "rent";
   location?: string;
+  /** Pre-resolved willhaben areaId; when set, `location` is not resolved again. */
+  area_id?: string;
   price_from?: number;
   price_to?: number;
   rooms?: number;
@@ -372,9 +379,12 @@ export interface RealEstateSearchInput {
 }
 
 export interface CarSearchInput {
+  keyword?: string;
   make?: string;
   model?: string;
   location?: string;
+  /** Pre-resolved willhaben areaId; when set, `location` is not resolved again. */
+  area_id?: string;
   price_from?: number;
   price_to?: number;
   year_from?: number;

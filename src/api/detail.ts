@@ -1,8 +1,9 @@
 // Willhaben Ad Detail API - Get full listing details
 import { WillhabenAdDetail, SimplifiedListingDetail } from "./types.js";
 import { scrapeAdDetail } from "./scraper.js";
-import { attributesToMap } from "./search.js";
+import { attributesToMap, stripRedundantAttributes } from "./search.js";
 import { VERTICAL_NAMES } from "../utils/constants.js";
+import { sanitizeListingDetail } from "../utils/formatters.js";
 
 /**
  * Get full details for a specific listing by ad ID.
@@ -12,17 +13,96 @@ import { VERTICAL_NAMES } from "../utils/constants.js";
  * yields everything. (The publicapi `/atdetail/v1/{id}` endpoint returns a
  * widget-based payload that requires an application token, so it is not used.)
  */
+const LISTING_ID_RE = /^\d{1,16}$/;
+
+function attrString(attrs: Record<string, string | string[]>, key: string): string | undefined {
+  const value = attrs[key];
+  if (value == null) return undefined;
+  const text = Array.isArray(value) ? value[0] : value;
+  return text ? String(text) : undefined;
+}
+
 export async function getListingDetail(id: string): Promise<SimplifiedListingDetail | null> {
-  const adDetail = await scrapeAdDetail(`/iad/object?adId=${id}`);
+  if (!LISTING_ID_RE.test(id)) {
+    throw new Error("Invalid listing id: must be 1-16 digits");
+  }
+  const adDetail = await scrapeAdDetail(`/iad/object?adId=${encodeURIComponent(id)}`);
   return adDetail ? simplifyAdDetail(adDetail) : null;
+}
+
+/**
+ * Relative willhaben SEO path only (no absolute URLs, `..`, query, hash, or schemes).
+ * Bare slugs get the `/iad/` prefix; paths that already start with `/iad/` are kept.
+ */
+function resolveSeoUrlPath(seoUrl: string): string {
+  const trimmed = seoUrl.trim();
+  if (!trimmed) {
+    throw new Error("Invalid SEO path");
+  }
+  if (
+    trimmed.includes("..") ||
+    trimmed.includes("//") ||
+    /[?#\\]/.test(trimmed) ||
+    /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)
+  ) {
+    throw new Error("Invalid SEO path");
+  }
+
+  const urlPath = trimmed.startsWith("/") ? trimmed : `/iad/${trimmed}`;
+  if (!urlPath.startsWith("/iad/") || urlPath === "/iad/") {
+    throw new Error("Invalid SEO path");
+  }
+  // A trailing slash is normal on willhaben canonical paths; empty *middle*
+  // segments (`a//b`) are still rejected.
+  const rest = urlPath.slice("/iad/".length).replace(/\/+$/, "");
+  if (!rest || rest.split("/").some((seg) => seg.length === 0)) {
+    throw new Error("Invalid SEO path");
+  }
+  return `/iad/${rest}`;
+}
+
+/**
+ * Turn a listing URL into a relative `/iad/…` SEO path, or `null` if it is not
+ * a usable willhaben path (absolute URL with query, empty, off-scheme, …).
+ */
+export function listingSeoPath(url: string): string | null {
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  let path: string;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.search || parsed.hash) return null;
+    path = parsed.pathname;
+  } catch {
+    path = trimmed;
+  }
+  try {
+    return resolveSeoUrlPath(path);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch details via the canonical SEO path when the listing already has one
+ * (one dispatch hop). Falls back to `/iad/object?adId=` which 308s onto that
+ * path and therefore costs two slots.
+ */
+export async function getListingDetailFor(listing: {
+  id: string;
+  url: string;
+}): Promise<SimplifiedListingDetail | null> {
+  const path = listingSeoPath(listing.url);
+  if (path) return getListingDetailBySeoUrl(path);
+  return getListingDetail(listing.id);
 }
 
 /**
  * Get listing detail by SEO URL (more reliable than ID-only)
  */
 export async function getListingDetailBySeoUrl(seoUrl: string): Promise<SimplifiedListingDetail | null> {
-  // Ensure URL starts with /iad/
-  const urlPath = seoUrl.startsWith("/") ? seoUrl : `/iad/${seoUrl}`;
+  const urlPath = resolveSeoUrlPath(seoUrl);
   const adDetail = await scrapeAdDetail(urlPath);
 
   if (!adDetail) {
@@ -38,7 +118,9 @@ export async function getListingDetailBySeoUrl(seoUrl: string): Promise<Simplifi
 function simplifyAdDetail(ad: WillhabenAdDetail): SimplifiedListingDetail {
   const attrs = attributesToMap(ad.attributes?.attribute);
 
-  const images = ad.advertImageList?.advertImage?.map((img) => img.referenceImageUrl ?? img.mainImageUrl) ?? [];
+  const images = (ad.advertImageList?.advertImage ?? [])
+    .map((img) => img.referenceImageUrl ?? img.mainImageUrl)
+    .filter((u): u is string => typeof u === "string" && u.length > 0);
 
   const seoUrl = attrs.SEO_URL as string | undefined;
   const url = seoUrl
@@ -48,20 +130,33 @@ function simplifyAdDetail(ad: WillhabenAdDetail): SimplifiedListingDetail {
   const priceForDisplay = attrs.PRICE_FOR_DISPLAY as string | undefined;
   const priceNumber = attrs.PRICE as string | undefined;
   const location = attrs.LOCATION as string | undefined;
-  const heading = attrs.HEADING as string | undefined;
-  const bodyDyn = attrs.BODY_DYN as string | undefined;
-  const description = bodyDyn ?? ad.description ?? "";
+  const heading = attrString(attrs, "HEADING");
+  // Detail pages carry the advert prose in DESCRIPTION; search cards still use
+  // BODY_DYN. The top-level `ad.description` is the short heading, not a body.
+  const descriptionAttr = attrString(attrs, "DESCRIPTION");
+  const bodyDyn = attrString(attrs, "BODY_DYN");
+  const description = descriptionAttr ?? bodyDyn ?? ad.description ?? "";
 
-  return {
+  const parsedPrice = priceNumber ? parseFloat(priceNumber) : NaN;
+
+  return sanitizeListingDetail({
     id: ad.id,
-    title: heading ?? description.substring(0, 100),
+    // Real detail pages send no HEADING, so `ad.description` (the short heading,
+    // per above) has to rank ahead of slicing the raw HTML body for a title.
+    title: heading ?? ad.description ?? description.substring(0, 100),
     description,
     price: priceForDisplay ?? null,
-    price_number: priceNumber ? parseFloat(priceNumber) : null,
+    price_number: Number.isFinite(parsedPrice) ? parsedPrice : null,
     location: location ?? null,
     url,
     images,
-    attributes: attrs,
+    attributes: (() => {
+      const stripped = stripRedundantAttributes(attrs);
+      // Folded into `description` above; keeping them would duplicate a body.
+      delete stripped.DESCRIPTION;
+      if (descriptionAttr || bodyDyn) delete stripped.BODY_DYN;
+      return stripped;
+    })(),
     vertical: VERTICAL_NAMES[ad.verticalId] ?? String(ad.verticalId),
     is_private: attrs.ISPRIVATE === "1",
     advertiser: {
@@ -76,11 +171,15 @@ function simplifyAdDetail(ad: WillhabenAdDetail): SimplifiedListingDetail {
       postcode: ad.advertAddressDetails?.postCode ?? null,
       city: ad.advertAddressDetails?.postalName ?? ad.advertAddressDetails?.municipality ?? null,
       country: ad.advertAddressDetails?.country ?? null,
-      coordinates: (attrs.COORDINATES as string) ?? null,
+      coordinates: attrs.COORDINATES
+        ? Array.isArray(attrs.COORDINATES)
+          ? attrs.COORDINATES.join(",")
+          : attrs.COORDINATES
+        : null,
     },
     contact_type: ad.contactOption?.contactType ?? null,
     chat_enabled: ad.chatEnabled ?? false,
     published_date: ad.publishedDate ?? null,
     category_id: ad.categoryTreeId ?? null,
-  };
+  });
 }

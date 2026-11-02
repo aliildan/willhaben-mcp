@@ -1,8 +1,10 @@
 // Willhaben Jobs API - Uses publicapi.willhaben.at (no scraping needed)
 import { WillhabenJobsSearchResult, WillhabenJobAd, SimplifiedListing, VerticalId } from "./types.js";
 import { fetchPublicApi, scrapeSearchResults } from "./scraper.js";
-import { attributesToMap, simplifyAdSummary } from "./search.js";
-import { SORT_CODES } from "../utils/constants.js";
+import { attributesToMap, simplifyAdSummary, stripRedundantAttributes } from "./search.js";
+import { SORT_CODES, clampSearchPaging } from "../utils/constants.js";
+import { isAbortError, WillhabenBlockedError, WillhabenTimeoutError } from "./httpClient.js";
+import { sanitizeListing } from "../utils/formatters.js";
 
 /**
  * Simplify a job ad into a clean, readable format
@@ -17,7 +19,7 @@ function simplifyJobAd(ad: WillhabenJobAd): SimplifiedListing {
   const published = (attrs.PUBLISHED_String as string) ?? (attrs.PUBLISHED as string) ?? null;
   const imageUrl = ad.advertImageList?.mainImageUrl ?? ad.advertImageList?.referenceImageUrl ?? null;
 
-  return {
+  return sanitizeListing({
     id: ad.id,
     title,
     price: null,
@@ -26,11 +28,11 @@ function simplifyJobAd(ad: WillhabenJobAd): SimplifiedListing {
     url,
     image_url: imageUrl,
     published,
-    attributes: attrs,
+    attributes: stripRedundantAttributes(attrs),
     vertical: "Jobs",
     is_private: false,
     advertiser_name: orgName,
-  };
+  });
 }
 
 /**
@@ -43,7 +45,8 @@ export async function searchJobs(input: {
   rows?: number;
   page?: number;
 }) {
-  const { keyword, job_type, sort = "newest", rows = 30, page = 1 } = input;
+  const { keyword, job_type, sort = "newest" } = input;
+  const { rows, page } = clampSearchPaging(input.rows, input.page);
 
   const params = new URLSearchParams();
   params.set("rows", String(rows));
@@ -83,7 +86,15 @@ export async function searchJobs(input: {
       description: result.searchTitle,
     };
   } catch (error) {
-    // Fallback: try scraping the jobs page
+    if (
+      isAbortError(error) ||
+      error instanceof WillhabenBlockedError ||
+      error instanceof WillhabenTimeoutError
+    ) {
+      throw error;
+    }
+    // Fallback: try scraping the jobs page only when the public API is down,
+    // not when the client cancelled or willhaben asked us to back off.
     return searchJobsViaScraping(keyword, rows, page, sort);
   }
 }
@@ -91,7 +102,8 @@ export async function searchJobs(input: {
 /**
  * Fallback: Search jobs via page scraping
  */
-async function searchJobsViaScraping(keyword?: string, rows: number = 30, page: number = 1, sort?: string) {
+async function searchJobsViaScraping(keyword?: string, rowsIn: number = 30, pageIn: number = 1, sort?: string) {
+  const { rows, page } = clampSearchPaging(rowsIn, pageIn);
   const params = new URLSearchParams();
   params.set("rows", String(rows));
   params.set("page", String(page));
@@ -102,16 +114,12 @@ async function searchJobsViaScraping(keyword?: string, rows: number = 30, page: 
   const urlPath = `/iad/stellenmarkt?${params.toString()}`;
   const { result } = await scrapeSearchResults(urlPath);
 
-  if (!result) {
-    return { total: 0, page, rows_per_page: rows, listings: [], vertical: "jobs" };
-  }
-
   const listings = (result.advertSummaryList?.advertSummary ?? []).map(simplifyAdSummary);
 
   return {
     total: result.rowsFound,
-    page: result.pageRequested,
-    rows_per_page: result.rowsRequested,
+    page: result.pageRequested ?? page,
+    rows_per_page: result.rowsRequested ?? rows,
     listings,
     vertical: "jobs",
     description: result.searchTitle,
